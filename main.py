@@ -366,28 +366,47 @@ def gerar_html_briefing(data_ref, dia, mes, acum, tops_dia, conteudo):
 # POSTAR NO TWITTER
 # ============================================================
 def postar_twitter(texto, imagem_bytes):
-    # Upload via v2 /2/media/upload usando OAuth 1.0a manualmente
     from requests_oauthlib import OAuth1
     auth = OAuth1(TW_API_KEY, TW_API_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET)
-
-    # Upload da imagem via endpoint v2
     imagem_bytes.seek(0)
-    files = {'media': ('card.png', imagem_bytes.read(), 'image/png')}
-    upload_resp = requests.post(
+    img_bytes = imagem_bytes.read()
+
+    # Tenta vários endpoints de upload (X mudou recentemente)
+    endpoints = [
+        'https://upload.twitter.com/1.1/media/upload.json',
+        'https://upload.x.com/1.1/media/upload.json',
         'https://api.x.com/2/media/upload',
-        auth=auth, files=files, timeout=60
-    )
-    print(f"  Upload v2 status: {upload_resp.status_code}")
-    if not upload_resp.ok:
-        print(f"  Upload erro: {upload_resp.text}")
-        upload_resp.raise_for_status()
+        'https://upload.x.com/2/media/upload',
+    ]
 
-    upload_data = upload_resp.json()
-    # v2 retorna dentro de "data"
-    media_id = upload_data.get('data', {}).get('id') or upload_data.get('id') or upload_data.get('media_id_string') or str(upload_data.get('media_id'))
-    print(f"  Media ID: {media_id}")
+    media_id = None
+    last_err = None
+    for url in endpoints:
+        try:
+            print(f"  Tentando upload em: {url}")
+            files = {'media': ('card.png', img_bytes, 'image/png')}
+            r = requests.post(url, auth=auth, files=files, timeout=60)
+            print(f"    Status: {r.status_code}")
+            if r.ok:
+                data = r.json()
+                media_id = (data.get('data', {}).get('id') or
+                            data.get('media_id_string') or
+                            str(data.get('media_id')) if data.get('media_id') else None or
+                            data.get('id'))
+                if media_id:
+                    print(f"    ✅ Media ID: {media_id}")
+                    break
+            else:
+                last_err = f"{r.status_code}: {r.text[:200]}"
+                print(f"    ❌ {last_err}")
+        except Exception as e:
+            last_err = str(e)
+            print(f"    ❌ Exception: {e}")
 
-    # Post do tweet via tweepy v2
+    if not media_id:
+        raise Exception(f"Upload falhou em todos endpoints. Último erro: {last_err}")
+
+    # Posta o tweet via tweepy v2
     client = tweepy.Client(
         consumer_key=TW_API_KEY, consumer_secret=TW_API_SECRET,
         access_token=TW_ACCESS_TOKEN, access_token_secret=TW_ACCESS_SECRET
