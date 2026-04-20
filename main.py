@@ -366,17 +366,33 @@ def gerar_html_briefing(data_ref, dia, mes, acum, tops_dia, conteudo):
 # POSTAR NO TWITTER
 # ============================================================
 def postar_twitter(texto, imagem_bytes):
-    # v1.1 pra upload de mídia
-    auth = tweepy.OAuth1UserHandler(TW_API_KEY, TW_API_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET)
-    api_v1 = tweepy.API(auth)
-    media = api_v1.media_upload(filename='card.png', file=imagem_bytes)
+    # Upload via v2 /2/media/upload usando OAuth 1.0a manualmente
+    from requests_oauthlib import OAuth1
+    auth = OAuth1(TW_API_KEY, TW_API_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET)
 
-    # v2 pra postar
+    # Upload da imagem via endpoint v2
+    imagem_bytes.seek(0)
+    files = {'media': ('card.png', imagem_bytes.read(), 'image/png')}
+    upload_resp = requests.post(
+        'https://api.x.com/2/media/upload',
+        auth=auth, files=files, timeout=60
+    )
+    print(f"  Upload v2 status: {upload_resp.status_code}")
+    if not upload_resp.ok:
+        print(f"  Upload erro: {upload_resp.text}")
+        upload_resp.raise_for_status()
+
+    upload_data = upload_resp.json()
+    # v2 retorna dentro de "data"
+    media_id = upload_data.get('data', {}).get('id') or upload_data.get('id') or upload_data.get('media_id_string') or str(upload_data.get('media_id'))
+    print(f"  Media ID: {media_id}")
+
+    # Post do tweet via tweepy v2
     client = tweepy.Client(
         consumer_key=TW_API_KEY, consumer_secret=TW_API_SECRET,
         access_token=TW_ACCESS_TOKEN, access_token_secret=TW_ACCESS_SECRET
     )
-    resp = client.create_tweet(text=texto, media_ids=[media.media_id])
+    resp = client.create_tweet(text=texto, media_ids=[media_id])
     return resp.data.get('id') if resp.data else None
 
 # ============================================================
