@@ -421,6 +421,45 @@ def postar_twitter(texto, imagem_bytes):
 def health():
     return jsonify({'status': 'ok', 'service': 'briefing-bot'})
 
+@app.route('/test-twitter', methods=['GET'])
+def test_twitter():
+    """Testa as credenciais do Twitter postando um tweet de texto simples."""
+    try:
+        from requests_oauthlib import OAuth1
+        client = tweepy.Client(
+            consumer_key=TW_API_KEY, consumer_secret=TW_API_SECRET,
+            access_token=TW_ACCESS_TOKEN, access_token_secret=TW_ACCESS_SECRET
+        )
+        # Primeiro tenta verificar identidade
+        me_url = 'https://api.x.com/2/users/me'
+        auth = OAuth1(TW_API_KEY, TW_API_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET)
+        r = requests.get(me_url, auth=auth, timeout=15)
+        me_info = {'status': r.status_code, 'body': r.text[:500]}
+
+        # Tenta postar um tweet de teste
+        from datetime import datetime as dt2
+        texto = f"Teste automatizado {dt2.now().strftime('%H:%M:%S')}"
+        tweet_resp = None
+        tweet_err = None
+        try:
+            resp = client.create_tweet(text=texto)
+            tweet_resp = {'id': resp.data.get('id'), 'text': texto}
+        except Exception as e:
+            tweet_err = str(e)
+
+        return jsonify({
+            'keys_preview': {
+                'api_key': TW_API_KEY[:6] + '...',
+                'access_token': TW_ACCESS_TOKEN[:20] + '...',
+            },
+            'users_me': me_info,
+            'tweet_test': tweet_resp,
+            'tweet_error': tweet_err,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
 @app.route('/fechar-dia', methods=['POST', 'OPTIONS'])
 def fechar_dia():
     # CORS
