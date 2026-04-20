@@ -46,9 +46,9 @@ def sb_get(path):
     r.raise_for_status()
     return r.json()
 
-def sb_upsert(table, body):
+def sb_upsert(table, body, conflict='data_ref'):
     r = requests.post(
-        f"{SUPABASE_URL}/rest/v1/{table}",
+        f"{SUPABASE_URL}/rest/v1/{table}?on_conflict={conflict}",
         headers={**sb_headers(), 'Prefer': 'resolution=merge-duplicates,return=representation'},
         json=body, timeout=30
     )
