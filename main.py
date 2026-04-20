@@ -537,23 +537,26 @@ def fechar_dia():
             timeout=15
         ).raise_for_status()
 
-        # 7. Postar Twitter
+        # 7. Gerar card do Twitter e salvar como base64 para download manual
         tweet_id = None
-        if postar_tw:
-            try:
-                print("  → Gerando card do Twitter...")
-                card = gerar_card_twitter(data_ref, dia, mes, acum, conteudo.get('frase_twitter', ''))
-                texto_tw = f"Fechamento de {dt_ref.strftime('%d/%m')}\n\n{conteudo.get('frase_twitter','')}"
-                if len(texto_tw) > 270:
-                    texto_tw = conteudo.get('frase_twitter','')[:270]
-                print("  → Postando no Twitter...")
-                tweet_id = postar_twitter(texto_tw, card)
-                if tweet_id:
-                    sb_upsert('briefings', {'data_ref': data_ref, 'twitter_post_id': str(tweet_id)})
-                    print(f"  ✅ Tweet postado: {tweet_id}")
-            except Exception as e:
-                print(f"  ⚠️ Erro Twitter: {e}")
-                traceback.print_exc()
+        texto_tw = f"Fechamento de {dt_ref.strftime('%d/%m')}\n\n{conteudo.get('frase_twitter','')}"
+        try:
+            print("  → Gerando card do Twitter...")
+            card = gerar_card_twitter(data_ref, dia, mes, acum, conteudo.get('frase_twitter', ''))
+            import base64
+            card.seek(0)
+            card_b64 = base64.b64encode(card.read()).decode('ascii')
+            sb_upsert('briefings', {
+                'data_ref': data_ref,
+                'twitter_post_id': f"MANUAL::{texto_tw}",  # guarda texto sugerido
+            })
+            # Salva card base64 via campo destaques_json (reutiliza)
+            # Simpler: retorna no response pra dashboard baixar
+            print(f"  ✅ Card gerado ({len(card_b64)} chars base64)")
+        except Exception as e:
+            print(f"  ⚠️ Erro gerando card: {e}")
+            traceback.print_exc()
+            card_b64 = None
 
         print("✅ Fechamento concluído!\n")
 
@@ -561,7 +564,8 @@ def fechar_dia():
             'ok': True,
             'data_ref': data_ref,
             'dia': {'plU': dia['plU'], 'roiU': dia['roiU'], 'entradas': dia['entradas']},
-            'twitter_id': str(tweet_id) if tweet_id else None,
+            'twitter_card_base64': card_b64,
+            'twitter_text': texto_tw,
         }), 200, headers_cors
 
     except Exception as e:
