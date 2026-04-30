@@ -573,6 +573,280 @@ def fechar_dia():
         return jsonify({'ok': False, 'error': str(e)}), 500, headers_cors
 
 
+# ============================================================
+# ENDPOINT /insights — gera insights via Claude Haiku 4.5 com base nos filtros do dashboard
+# ============================================================
+def gerar_insights_claude(periodo_label, dia_atual_iso, agg, breakdowns, filtros_aplicados):
+    """
+    Recebe métricas agregadas + breakdowns e gera insights em JSON.
+    periodo_label: string descritiva do período (ex: "abril/2026", "últimos 30 dias")
+    dia_atual_iso: data atual em ISO (pra Claude saber "hoje")
+    agg: dict com métricas agregadas {entradas, plU, plR, roiU, acerto, won, settled, invU, invR}
+    breakdowns: dict com top tipsters/bookies/operadores/esportes/mercados/dias_semana
+    filtros_aplicados: dict do que foi filtrado (pra Claude entender o recorte)
+    """
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+    # Volume mínimo pra valer insight
+    if agg['settled'] < 10:
+        return {
+            'frase_contexto': None,
+            'insights': [],
+            'volume_insuficiente': True,
+        }
+
+    # Monta resumo dos dados
+    dados = f"""
+PERÍODO ANALISADO: {periodo_label}
+HOJE: {dia_atual_iso}
+
+FILTROS APLICADOS:
+{json.dumps(filtros_aplicados, ensure_ascii=False, indent=2)}
+
+MÉTRICAS AGREGADAS:
+- Entradas finalizadas: {agg['settled']} (total {agg['entradas']}, pendentes {agg['entradas']-agg['settled']})
+- P/L: {fmtU(agg['plU'])} ({fmtR(agg['plR'])})
+- ROI: {pct(agg['roiU'])} (u) / {pct(agg['roiR'])} (R$)
+- Taxa acerto: {agg['acerto']:.1f}% ({agg['won']}/{agg['settled']})
+- Investimento: {fmtU(agg['invU'])} ({fmtR(agg['invR'])})
+
+TOP TIPSTERS (nome, p/l u, entradas, roi%):
+{json.dumps(breakdowns.get('tipsters', [])[:10], ensure_ascii=False)}
+
+TOP BOOKIES (nome, p/l u, entradas, roi%):
+{json.dumps(breakdowns.get('bookies', [])[:10], ensure_ascii=False)}
+
+OPERADORES (nome, p/l u, entradas):
+{json.dumps(breakdowns.get('operadores', [])[:10], ensure_ascii=False)}
+
+ESPORTES (nome, p/l u, entradas):
+{json.dumps(breakdowns.get('esportes', [])[:10], ensure_ascii=False)}
+
+MERCADOS (nome, p/l u, entradas):
+{json.dumps(breakdowns.get('mercados', [])[:10], ensure_ascii=False)}
+
+POR DIA DA SEMANA (dia, p/l u, entradas):
+{json.dumps(breakdowns.get('dias_semana', []), ensure_ascii=False)}
+"""
+
+    prompt = f"""Você é o gerador de insights do dashboard de registros do Mercado Esportivo, uma operação profissional de apostas EV+ baseada em volume.
+
+Sua tarefa: analisar os dados filtrados abaixo e gerar insights úteis e específicos sobre o período. Não repita números brutos que o usuário já vê nos cards do topo do dashboard — interprete, conecte pontos, aponte padrões.
+
+DADOS:
+{dados}
+
+REGRAS:
+- Tom: misto formal e casual. Direto, sem clichê, sem repetir métricas óbvias.
+- NUNCA compare operadores entre si (ex: "Diego rendeu mais que Amaral"). Pode citar nomes individuais ("Amaral puxou +8u no período"), só não comparar.
+- Se houver dado interessante sobre tipster/bookie/esporte/mercado/dia da semana, use.
+- Se o resultado for negativo ou variância ruim, seja honesto sem ser dramático.
+- Cite operadores por nome quando relevante.
+- Não invente — só use o que tá nos dados.
+- Se algum breakdown estiver vazio (operador único, esporte único, etc.), ignore aquela dimensão.
+
+FORMATO DE RESPOSTA (JSON puro, sem markdown, sem ```):
+
+{{
+  "frase_contexto": "frase única de 1 linha (máx 120 chars) que contextualiza o período. Ex: 'Abril fechou em +18u (ROI 6%) mas dependendo do GDA Tradicional.' Seja específico.",
+  "insights": [
+    {{"emoji": "🏆", "texto": "Insight 1 — máx 100 chars."}},
+    {{"emoji": "🎯", "texto": "Insight 2 — máx 100 chars."}},
+    {{"emoji": "🔥", "texto": "Insight 3 — máx 100 chars."}}
+  ]
+}}
+
+Gere 3 a 4 insights. Use emojis variados (🏆 🎯 🔥 ⚠️ 📊 💡 ⏱ 📈 📉 🎲). Responda APENAS o JSON."""
+
+    resp = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    text = resp.content[0].text.strip()
+    text = re.sub(r'^```(?:json)?\s*', '', text)
+    text = re.sub(r'\s*```$', '', text)
+    return json.loads(text)
+
+
+def filtrar_apostas(apostas, filtros):
+    """Aplica filtros do dashboard sobre a lista de apostas."""
+    res = list(apostas)
+    if filtros.get('operador_id'):
+        res = [a for a in res if a.get('operador_id') == filtros['operador_id']]
+    if filtros.get('tipster_id'):
+        res = [a for a in res if a.get('tipster_id') == filtros['tipster_id']]
+    if filtros.get('bookie_id'):
+        res = [a for a in res if a.get('bookie_id') == filtros['bookie_id']]
+    if filtros.get('esporte_id'):
+        res = [a for a in res if a.get('esporte_id') == filtros['esporte_id']]
+    if filtros.get('mercado'):
+        res = [a for a in res if (a.get('mercado') or '') == filtros['mercado']]
+    if filtros.get('status'):
+        res = [a for a in res if a.get('status') == filtros['status']]
+    if filtros.get('data_de'):
+        res = [a for a in res if (a.get('data_evento') or '') >= filtros['data_de']]
+    if filtros.get('data_ate'):
+        res = [a for a in res if (a.get('data_evento') or '') <= filtros['data_ate']]
+    return res
+
+
+def breakdowns_periodo(apostas, stakes, tipsters, bookies, operadores, esportes, mercados):
+    """Agrupa apostas por dimensão e retorna top breakdowns."""
+    settled = [a for a in apostas if a.get('status') not in ('PENDING', None, '')]
+
+    def agrupar(field, cache_arr):
+        m = {}
+        for a in settled:
+            fk = a.get(field)
+            if not fk:
+                continue
+            if field == 'mercado':
+                # mercado é text livre
+                key = fk
+            else:
+                key = fk
+            if key not in m:
+                m[key] = {'plU': 0, 'invU': 0, 'entradas': 0, 'won': 0, 'settled': 0}
+            m[key]['plU'] += float(a.get('lucro_unidades') or 0)
+            m[key]['invU'] += float(a.get('stake_unidades') or 0)
+            m[key]['entradas'] += 1
+            m[key]['settled'] += 1
+            if a.get('status') in ('WON', 'HALF WON'):
+                m[key]['won'] += 1
+
+        # Resolve nomes
+        if cache_arr is not None:
+            name_map = {x['id']: x['nome'] for x in cache_arr}
+        else:
+            name_map = None
+
+        out = []
+        for key, vals in m.items():
+            nome = name_map.get(key, key) if name_map else key
+            roi = (vals['plU'] / vals['invU'] * 100) if vals['invU'] > 0 else 0
+            out.append({
+                'nome': nome,
+                'plU': round(vals['plU'], 2),
+                'entradas': vals['entradas'],
+                'roi': round(roi, 1),
+            })
+        out.sort(key=lambda x: x['plU'], reverse=True)
+        return out
+
+    # Dia da semana (0=segunda, 6=domingo em pt)
+    dias_pt = ['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb', 'Dom']
+    by_dia = {d: {'plU': 0, 'entradas': 0} for d in dias_pt}
+    for a in settled:
+        d_str = a.get('data_evento')
+        if not d_str:
+            continue
+        try:
+            dt = datetime.strptime(d_str[:10], '%Y-%m-%d').date()
+            dia_label = dias_pt[dt.weekday()]
+            by_dia[dia_label]['plU'] += float(a.get('lucro_unidades') or 0)
+            by_dia[dia_label]['entradas'] += 1
+        except Exception:
+            pass
+
+    return {
+        'tipsters': agrupar('tipster_id', tipsters),
+        'bookies': agrupar('bookie_id', bookies),
+        'operadores': agrupar('operador_id', operadores),
+        'esportes': agrupar('esporte_id', esportes),
+        'mercados': agrupar('mercado', None),
+        'dias_semana': [{'dia': d, **v} for d, v in by_dia.items() if v['entradas'] > 0],
+    }
+
+
+@app.route('/insights', methods=['POST', 'OPTIONS'])
+def insights():
+    # CORS
+    if request.method == 'OPTIONS':
+        return ('', 204, {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type',
+        })
+
+    headers_cors = {'Access-Control-Allow-Origin': '*'}
+
+    try:
+        body = request.get_json() or {}
+        filtros = body.get('filtros', {}) or {}
+
+        print(f"\n📊 Insights pedido com filtros: {filtros}")
+
+        # Buscar apostas, stakes, cadastros
+        apostas = sb_get('apostas?select=data_evento,stake_unidades,lucro_unidades,status,tipster_id,bookie_id,operador_id,esporte_id,mercado,odd&limit=100000')
+        stakes = sb_get('stakes_historico?select=tipster_id,valor_reais,vigente_a_partir')
+        tipsters = sb_get('tipsters?select=id,nome')
+        bookies = sb_get('bookies?select=id,nome')
+        operadores = sb_get('operadores?select=id,nome')
+        esportes = sb_get('esportes?select=id,nome')
+        mercados = sb_get('mercados?select=id,nome')
+
+        # Aplicar filtros
+        apostas_filtradas = filtrar_apostas(apostas, filtros)
+
+        # Determinar período
+        de = filtros.get('data_de') or (min((a.get('data_evento') for a in apostas_filtradas if a.get('data_evento')), default=INICIO_OPERACAO))
+        ate = filtros.get('data_ate') or datetime.now(BRT).strftime('%Y-%m-%d')
+
+        agg = agregar_periodo(apostas_filtradas, stakes, de, ate)
+        breakdowns = breakdowns_periodo(apostas_filtradas, stakes, tipsters, bookies, operadores, esportes, mercados)
+
+        # Label do período
+        if filtros.get('data_de') and filtros.get('data_ate'):
+            periodo_label = f"{filtros['data_de']} a {filtros['data_ate']}"
+        elif filtros.get('data_de'):
+            periodo_label = f"a partir de {filtros['data_de']}"
+        elif filtros.get('data_ate'):
+            periodo_label = f"até {filtros['data_ate']}"
+        else:
+            periodo_label = "todo o histórico"
+
+        # Resolver nomes nos filtros pra Claude entender
+        def name_of(arr, fk):
+            if not fk: return None
+            for x in arr:
+                if x['id'] == fk: return x['nome']
+            return fk
+        filtros_resolvidos = {
+            'periodo': periodo_label,
+            'operador': name_of(operadores, filtros.get('operador_id')),
+            'tipster': name_of(tipsters, filtros.get('tipster_id')),
+            'bookie': name_of(bookies, filtros.get('bookie_id')),
+            'esporte': name_of(esportes, filtros.get('esporte_id')),
+            'mercado': filtros.get('mercado'),
+            'status': filtros.get('status'),
+        }
+        filtros_resolvidos = {k: v for k, v in filtros_resolvidos.items() if v}
+
+        hoje = datetime.now(BRT).strftime('%Y-%m-%d')
+        resultado = gerar_insights_claude(periodo_label, hoje, agg, breakdowns, filtros_resolvidos)
+
+        print(f"  ✅ Insights gerados: {len(resultado.get('insights', []))} bullets")
+
+        return jsonify({
+            'ok': True,
+            'frase_contexto': resultado.get('frase_contexto'),
+            'insights': resultado.get('insights', []),
+            'volume_insuficiente': resultado.get('volume_insuficiente', False),
+            'metricas': {
+                'entradas': agg['entradas'],
+                'settled': agg['settled'],
+                'plU': agg['plU'],
+                'roiU': agg['roiU'],
+            },
+        }), 200, headers_cors
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'ok': False, 'error': str(e)}), 500, headers_cors
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
