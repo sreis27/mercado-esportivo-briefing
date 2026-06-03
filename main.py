@@ -3,11 +3,10 @@ Briefing Diário - Mercado Esportivo
 Endpoint HTTP que gera o briefing, salva no Supabase, dispara no Telegram e posta no Twitter.
 """
 
-import os, json, io, re, traceback
+import os, io, traceback
 from datetime import datetime, timezone, timedelta, date
 from flask import Flask, request, jsonify
 import requests
-import anthropic
 from PIL import Image, ImageDraw, ImageFont
 import tweepy
 
@@ -18,7 +17,6 @@ SUPABASE_URL     = "https://yfdrifvhsiumdxgypkjm.supabase.co"
 SUPABASE_KEY     = os.environ.get("SUPABASE_KEY", "")
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-4659428992")
-ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY", "")
 TW_API_KEY       = os.environ.get("TW_API_KEY", "")
 TW_API_SECRET    = os.environ.get("TW_API_SECRET", "")
 TW_ACCESS_TOKEN  = os.environ.get("TW_ACCESS_TOKEN", "")
@@ -68,6 +66,12 @@ def pct(v):
     sign = '+' if v >= 0 else ''
     return f"{sign}{v:.1f}%".replace('.', ',')
 
+MESES_PT = ['', 'janeiro','fevereiro','março','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro']
+def mes_pt(dt):
+    return MESES_PT[dt.month]
+def data_extenso_pt(dt):
+    return f"{dt.day} de {MESES_PT[dt.month]} de {dt.year}"
+
 # ============================================================
 # BUSCAR E AGREGAR DADOS
 # ============================================================
@@ -113,172 +117,162 @@ def agregar_periodo(apostas, stakes, de, ate):
         'acerto': acerto,
     }
 
-def tops_periodo(apostas, stakes, de, ate, cache_tipsters, cache_bookies, cache_operadores):
+def tops_grupos_periodo(apostas, stakes, de, ate, cache_tipsters):
+    """Agrupa apostas settled do período por tipster (= grupo) com plU e plR."""
     filtradas = [a for a in apostas if de <= (a.get('data_evento') or '') <= ate and a.get('status') != 'PENDING']
-
-    def agrupar(field, cache_arr):
-        mp = {}
-        for a in filtradas:
-            fid = a.get(field)
-            item = next((c for c in cache_arr if c['id'] == fid), None) if cache_arr else None
-            nome = item['nome'] if item else 'Outros'
-            mp[nome] = mp.get(nome, 0) + float(a.get('lucro_unidades') or 0)
-        return sorted(mp.items(), key=lambda x: x[1], reverse=True)
-
-    top_t = agrupar('tipster_id', cache_tipsters)
-    top_b = agrupar('bookie_id', cache_bookies)
-    top_o = agrupar('operador_id', cache_operadores)
-
-    return {
-        'tipsters': top_t,
-        'bookies': top_b,
-        'operadores': top_o,
-    }
+    mp = {}
+    for a in filtradas:
+        tid = a.get('tipster_id')
+        if not tid:
+            continue
+        if tid not in mp:
+            item = next((c for c in cache_tipsters if c['id'] == tid), None)
+            mp[tid] = {'nome': item['nome'] if item else 'Outros', 'plU': 0.0, 'plR': 0.0, 'n': 0}
+        lu = float(a.get('lucro_unidades') or 0)
+        sv = get_stake_valor(tid, a.get('data_evento'), stakes) or 1
+        mp[tid]['plU'] += lu
+        mp[tid]['plR'] += lu * sv
+        mp[tid]['n']   += 1
+    return list(mp.values())
 
 # ============================================================
-# GERAR CONTEÚDO VIA CLAUDE
+# GERAR RESUMO DO TELEGRAM (sem IA)
 # ============================================================
-def gerar_conteudo_claude(data_ref, dia, mes, acum, tops_dia, tops_mes):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+def gerar_resumo_telegram(data_ref, dia, mes, acum, top_u, top_r):
+    """Monta o texto do Telegram em markdown a partir das métricas — sem IA."""
+    dt = datetime.strptime(data_ref, '%Y-%m-%d')
+    data_fmt = dt.strftime('%d/%m/%Y')
 
-    dados_resumidos = f"""
-DATA: {data_ref}
+    linhas = [
+        f"📊 *Fechamento de {data_fmt}*",
+        "",
+        f"*P/L:* {fmtU(dia['plU'])} ({fmtR(dia['plR'])})",
+        f"*ROI:* {pct(dia['roiU'])} u · {pct(dia['roiR'])} R$",
+        f"*Entradas:* {dia['entradas']} · acerto {dia['acerto']:.1f}%",
+    ]
 
-FECHAMENTO DO DIA:
-- Entradas: {dia['entradas']}
-- P/L: {fmtU(dia['plU'])} ({fmtR(dia['plR'])})
-- ROI: {pct(dia['roiU'])} (u) / {pct(dia['roiR'])} (R$)
-- Taxa de acerto: {dia['acerto']:.1f}% ({dia['won']}/{dia['settled']})
-- Investimento: {fmtU(dia['invU'])} ({fmtR(dia['invR'])})
+    if top_u:
+        linhas.append("")
+        linhas.append("🏆 *Top 3 — Unidades*")
+        medals = ['🥇', '🥈', '🥉']
+        for i, g in enumerate(top_u[:3]):
+            linhas.append(f"{medals[i]} {g['nome']}: {fmtU(g['plU'])}")
 
-MÊS:
-- Entradas: {mes['entradas']}
-- P/L: {fmtU(mes['plU'])} ({fmtR(mes['plR'])})
-- ROI: {pct(mes['roiU'])}
+    linhas.append("")
+    linhas.append(f"📅 *Mês:* {fmtU(mes['plU'])} (ROI {pct(mes['roiU'])})")
+    linhas.append(f"📈 *Acumulado:* {fmtU(acum['plU'])} (ROI {pct(acum['roiU'])})")
 
-ACUMULADO (desde 01/06/2025):
-- Entradas: {acum['entradas']}
-- P/L: {fmtU(acum['plU'])}
-- ROI: {pct(acum['roiU'])}
-
-TOP TIPSTERS DO DIA (nome, p/l em unidades):
-{json.dumps(tops_dia['tipsters'][:5], ensure_ascii=False)}
-
-TOP BOOKIES DO DIA:
-{json.dumps(tops_dia['bookies'][:5], ensure_ascii=False)}
-
-TOP OPERADORES DO DIA:
-{json.dumps(tops_dia['operadores'][:5], ensure_ascii=False)}
-"""
-
-    prompt = f"""Você é o gerador de briefings diários do Mercado Esportivo, uma operação profissional de apostas esportivas baseada em EV+ e volume.
-
-Dados de hoje:
-{dados_resumidos}
-
-Gere um JSON (sem markdown, sem ```, só o JSON puro) com:
-
-1. "frase_twitter" — UMA frase curta (máx 80 caracteres) criativa e sem clichê pra ilustrar o card do Twitter. EVITE frases manjadas tipo "o método fala mais alto", "consistência é tudo", "no longo prazo". Seja original, direto, meio filosófico, meio técnico. Tom de operador profissional que sabe o que faz.
-
-2. "destaque_positivo" — objeto com "titulo" (máx 60 chars) e "texto" (1-2 frases, máx 180 chars). Elege o tipster/bookie/operador de destaque positivo do dia.
-
-3. "destaque_alerta" — objeto com "titulo" e "texto". Elege um alerta relevante (sequência ruim, bookie no vermelho, etc). Se não houver nada preocupante, retorne null.
-
-4. "curiosidade" — objeto com "titulo" e "texto". Alguma curiosidade ou recorde do dia (maior odd, entrada inusitada, primeira vez, etc). Pode ser null se não achar nada.
-
-5. "resumo_telegram" — string formatada pro Telegram com markdown (*negrito*). Estrutura:
-   - Emoji + data
-   - Linha com P/L + ROI
-   - 1-2 destaques em bullets
-   - Nada muito longo (máx 8 linhas)
-
-Responda APENAS com o JSON, nada antes ou depois."""
-
-    resp = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    text = resp.content[0].text.strip()
-    # Remove markdown code fences se vierem
-    text = re.sub(r'^```(?:json)?\s*', '', text)
-    text = re.sub(r'\s*```$', '', text)
-    return json.loads(text)
+    return '\n'.join(linhas)
 
 # ============================================================
 # GERAR CARD DO TWITTER (imagem 1200x675)
 # ============================================================
-def gerar_card_twitter(data_ref, dia, mes, acum, frase):
+def gerar_card_twitter(data_ref, dia, mes, acum, top_u, top_r):
     W, H = 1200, 675
     img = Image.new('RGB', (W, H), color=(10, 10, 15))
     draw = ImageDraw.Draw(img)
 
-    # Tenta carregar JetBrains Mono, fallback pra fonte padrão
     try:
-        font_mono_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 16)
-        font_mono_mid   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 20)
-        font_mono_big   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 44)
-        font_sans_big   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 48)
+        f_xs   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
+        f_sm   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 16)
+        f_md   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 20)
+        f_lbl  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12)
+        f_big  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 36)
+        f_xl   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 44)
+        f_h1   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
     except:
-        font_mono_small = ImageFont.load_default()
-        font_mono_mid = ImageFont.load_default()
-        font_mono_big = ImageFont.load_default()
-        font_sans_big = ImageFont.load_default()
+        f_xs = f_sm = f_md = f_lbl = f_big = f_xl = f_h1 = ImageFont.load_default()
 
-    # Cores
     muted = (107, 107, 144)
     green = (0, 212, 170)
     red   = (255, 77, 106)
     white = (232, 232, 245)
+    accent = (108, 99, 255)
 
     # Topo
-    draw.text((64, 56), "MERCADO ESPORTIVO", font=font_mono_small, fill=muted)
+    draw.text((64, 40), "MERCADO ESPORTIVO", font=f_sm, fill=muted)
     dt = datetime.strptime(data_ref, '%Y-%m-%d')
-    draw.text((W - 200, 56), dt.strftime('%d · %m · %y'), font=font_mono_small, fill=muted)
+    data_str = dt.strftime('%d · %m · %y')
+    bbox = draw.textbbox((0,0), data_str, font=f_sm)
+    draw.text((W - 64 - (bbox[2]-bbox[0]), 40), data_str, font=f_sm, fill=muted)
 
-    # Frase central (quebra em 2 linhas se preciso)
-    y_frase = 210
-    max_w = W - 128
-    words = frase.split(' ')
-    linha1, linha2 = [], []
-    cur = []
-    for w in words:
-        test = ' '.join(cur + [w])
-        bbox = draw.textbbox((0,0), test, font=font_sans_big)
-        if bbox[2] - bbox[0] > max_w - 100:
-            linha1 = cur
-            cur = [w]
-        else:
-            cur.append(w)
-    if linha1:
-        linha2 = cur
-    else:
-        linha1 = cur
+    draw.text((64, 75), f"Fechamento de {dt.day} de {mes_pt(dt)}", font=f_h1, fill=white)
 
-    draw.text((64, y_frase), ' '.join(linha1), font=font_sans_big, fill=white)
-    if linha2:
-        draw.text((64, y_frase + 62), ' '.join(linha2), font=font_sans_big, fill=muted)
+    # Linha
+    draw.line([(64, 135), (W - 64, 135)], fill=(42, 42, 69), width=1)
 
-    # Linha divisória
-    draw.line([(64, H - 200), (W - 64, H - 200)], fill=(26, 26, 46), width=1)
+    # 4 cards principais (Entradas, P/L, ROI, Acerto)
+    cards = [
+        ('ENTRADAS', f"{dia['entradas']}",           None,                   white),
+        ('P/L',      fmtU(dia['plU']),                fmtR(dia['plR']),       green if dia['plU'] >= 0 else red),
+        ('ROI',      pct(dia['roiU']) + ' u',         pct(dia['roiR']) + ' R$', green if dia['roiU'] >= 0 else red),
+        ('ACERTO',   f"{dia['acerto']:.1f}%",         f"{dia['won']}/{dia['settled']}", white),
+    ]
+    card_w = (W - 128 - 36) // 4  # 4 cards, 12px gap
+    y_card = 160
+    for i, (label, v1, v2, cor) in enumerate(cards):
+        x = 64 + i * (card_w + 12)
+        # bg
+        draw.rounded_rectangle([(x, y_card), (x + card_w, y_card + 110)], radius=8, fill=(22, 22, 42))
+        draw.text((x + 14, y_card + 14), label, font=f_lbl, fill=muted)
+        draw.text((x + 14, y_card + 36), v1, font=f_big, fill=cor)
+        if v2:
+            draw.text((x + 14, y_card + 84), v2, font=f_xs, fill=muted)
 
-    # 3 colunas de números
+    # Top 3 grupos — Unidades e Financeiro lado a lado
+    y_top = 295
+    col_w = (W - 128 - 16) // 2
+    medals = ['1.', '2.', '3.']  # texto puro evita problema de fonte emoji
+    medal_colors = [(255, 216, 77), (192, 192, 192), (205, 127, 50)]
+
+    def desenhar_bloco_top(x0, titulo, lista, val_fn):
+        draw.rounded_rectangle([(x0, y_top), (x0 + col_w, y_top + 220)], radius=10, fill=(20, 23, 41))
+        draw.line([(x0, y_top), (x0, y_top + 220)], fill=accent, width=3)
+        draw.text((x0 + 16, y_top + 14), titulo, font=f_lbl, fill=accent)
+        if not lista:
+            draw.text((x0 + 16, y_top + 50), 'Sem dados no dia.', font=f_sm, fill=muted)
+            return
+        for i, g in enumerate(lista[:3]):
+            yr = y_top + 50 + i * 52
+            draw.text((x0 + 18, yr), medals[i], font=f_md, fill=medal_colors[i])
+            nome = g['nome']
+            # trunca nome se muito longo
+            max_nome_w = col_w - 200
+            while True:
+                bb = draw.textbbox((0,0), nome, font=f_sm)
+                if bb[2] - bb[0] <= max_nome_w or len(nome) <= 6:
+                    break
+                nome = nome[:-2] + '…' if not nome.endswith('…') else nome[:-2]
+            draw.text((x0 + 56, yr + 4), nome, font=f_sm, fill=white)
+            valor, raw = val_fn(g)
+            cor = green if raw >= 0 else red
+            bb = draw.textbbox((0,0), valor, font=f_md)
+            draw.text((x0 + col_w - 16 - (bb[2]-bb[0]), yr), valor, font=f_md, fill=cor)
+
+    top_u_sorted = sorted(top_u, key=lambda g: g['plU'], reverse=True)
+    top_r_sorted = sorted(top_r, key=lambda g: g['plR'], reverse=True)
+    desenhar_bloco_top(64,                  'TOP 3 — UNIDADES',    top_u_sorted, lambda g: (fmtU(g['plU']), g['plU']))
+    desenhar_bloco_top(64 + col_w + 16,     'TOP 3 — FINANCEIRO',  top_r_sorted, lambda g: (fmtR(g['plR']), g['plR']))
+
+    # Footer: linha + 3 colunas Hoje / Mês / Acumulado
+    draw.line([(64, H - 145), (W - 64, H - 145)], fill=(42, 42, 69), width=1)
     cols = [
-        ("HOJE", dia['plU'], dia['roiU']),
-        ("MÊS", mes['plU'], mes['roiU']),
+        ("HOJE",      dia['plU'],  dia['roiU']),
+        ("MÊS",       mes['plU'],  mes['roiU']),
         ("ACUMULADO", acum['plU'], acum['roiU']),
     ]
-    col_width = (W - 128) // 3
+    col_w_f = (W - 128) // 3
     for i, (label, plu, roi) in enumerate(cols):
-        x = 64 + i * col_width
-        draw.text((x, H - 170), label, font=font_mono_small, fill=muted)
-        color = green if plu >= 0 else red
-        draw.text((x, H - 140), fmtU(plu), font=font_mono_big, fill=color)
-        draw.text((x, H - 82), f"ROI {pct(roi)}", font=font_mono_small, fill=muted)
+        x = 64 + i * col_w_f
+        draw.text((x, H - 120), label, font=f_lbl, fill=muted)
+        cor = green if plu >= 0 else red
+        draw.text((x, H - 95), fmtU(plu), font=f_xl, fill=cor)
+        draw.text((x, H - 40), f"ROI {pct(roi)}", font=f_sm, fill=muted)
 
-    # Rodapé
-    draw.text((W - 200, H - 40), "@evvol_bettor", font=font_mono_small, fill=muted)
+    # @evvol_bettor
+    handle = "@evvol_bettor"
+    bb = draw.textbbox((0,0), handle, font=f_sm)
+    draw.text((W - 64 - (bb[2]-bb[0]), H - 40), handle, font=f_sm, fill=muted)
 
     buf = io.BytesIO()
     img.save(buf, format='PNG')
@@ -288,29 +282,55 @@ def gerar_card_twitter(data_ref, dia, mes, acum, frase):
 # ============================================================
 # GERAR HTML DO BRIEFING COMPLETO
 # ============================================================
-def gerar_html_briefing(data_ref, dia, mes, acum, tops_dia, conteudo):
+def gerar_html_briefing(data_ref, dia, mes, acum, top_u, top_r):
     dt = datetime.strptime(data_ref, '%Y-%m-%d')
-    dia_ptbr = dt.strftime('%d de %B de %Y')
-
-    def bloco(titulo_cor, titulo, texto, cor_texto):
-        return f'''<div style="background:#141729;border:1px solid #2a2a45;border-radius:12px;padding:20px 24px;margin-bottom:16px;border-left:3px solid {cor_texto}">
-  <div style="font-size:11px;color:{cor_texto};letter-spacing:0.08em;text-transform:uppercase;font-family:monospace;margin-bottom:8px">{titulo_cor}</div>
-  <div style="font-size:16px;font-weight:500;margin-bottom:6px;color:#e8e8f5">{titulo}</div>
-  <p style="font-size:14px;color:#b0b0c5;margin:0;line-height:1.6">{texto}</p>
-</div>'''
-
-    blocos = []
-    dp = conteudo.get('destaque_positivo')
-    if dp:
-        blocos.append(bloco("DESTAQUE", dp.get('titulo',''), dp.get('texto',''), "#00d4aa"))
-    da = conteudo.get('destaque_alerta')
-    if da:
-        blocos.append(bloco("ALERTA", da.get('titulo',''), da.get('texto',''), "#ffd84d"))
-    cur = conteudo.get('curiosidade')
-    if cur:
-        blocos.append(bloco("VOCÊ SABIA", cur.get('titulo',''), cur.get('texto',''), "#6c63ff"))
+    dia_ptbr = data_extenso_pt(dt)
 
     plcolor = '#00d4aa' if dia['plU'] >= 0 else '#ff4d6a'
+    roicolor = '#00d4aa' if dia['roiU'] >= 0 else '#ff4d6a'
+
+    def card(label, valor_principal, valor_sub=None, cor=None):
+        cor_v = cor or '#e8e8f5'
+        sub_html = f'<div style="font-size:11px;color:#6b6b90;margin-top:2px">{valor_sub}</div>' if valor_sub else ''
+        return f'''<div style="background:#16162a;border-radius:8px;padding:14px">
+      <div style="font-size:11px;color:#6b6b90;text-transform:uppercase;font-family:monospace">{label}</div>
+      <div style="font-size:20px;font-weight:500;margin-top:4px;color:{cor_v}">{valor_principal}</div>
+      {sub_html}
+    </div>'''
+
+    cards_topo = ''.join([
+        card('Entradas', f"{dia['entradas']}"),
+        card('Investido', fmtU(dia['invU']), fmtR(dia['invR'])),
+        card('P/L', fmtU(dia['plU']), fmtR(dia['plR']), plcolor),
+        card('ROI', pct(dia['roiU']) + ' u', pct(dia['roiR']) + ' R$', roicolor),
+        card('Acerto', f"{dia['acerto']:.1f}%", f"{dia['won']}/{dia['settled']}"),
+        card('Mês', fmtU(mes['plU']), f"ROI {pct(mes['roiU'])}"),
+    ])
+
+    medals = ['🥇', '🥈', '🥉']
+
+    def linha_top(g, i, valor_str, cor):
+        return f'''<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #1e1e35">
+      <span style="width:24px;text-align:center;font-size:14px">{medals[i] if i < 3 else (i+1)}</span>
+      <span style="flex:1;color:#e8e8f5;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{g['nome']}</span>
+      <span style="font-family:monospace;font-weight:500;color:{cor};font-size:14px">{valor_str}</span>
+    </div>'''
+
+    def bloco_top(titulo, lista, val_fn):
+        if not lista:
+            inner = '<div style="color:#6b6b90;font-size:13px;padding:8px 0">Sem dados no dia.</div>'
+        else:
+            inner = ''.join(linha_top(g, i, val_fn(g), '#00d4aa' if val_fn(g, raw=True) >= 0 else '#ff4d6a') for i, g in enumerate(lista[:3]))
+        return f'''<div style="background:#141729;border:1px solid #2a2a45;border-radius:12px;padding:20px 24px;border-left:3px solid #6c63ff">
+      <div style="font-size:11px;color:#6c63ff;letter-spacing:0.08em;text-transform:uppercase;font-family:monospace;margin-bottom:10px">{titulo}</div>
+      {inner}
+    </div>'''
+
+    def val_u(g, raw=False): return g['plU'] if raw else fmtU(g['plU'])
+    def val_r(g, raw=False): return g['plR'] if raw else fmtR(g['plR'])
+
+    bloco_u = bloco_top('Top 3 — Unidades',   sorted(top_u, key=lambda g: g['plU'], reverse=True), val_u)
+    bloco_r = bloco_top('Top 3 — Financeiro', sorted(top_r, key=lambda g: g['plR'], reverse=True), val_r)
 
     return f'''<div style="max-width:720px;margin:0 auto;padding:24px;font-family:system-ui,sans-serif;background:#0a0a0f;color:#e8e8f5">
   <div style="border-bottom:1px solid #2a2a45;padding-bottom:16px;margin-bottom:24px">
@@ -319,27 +339,14 @@ def gerar_html_briefing(data_ref, dia, mes, acum, tops_dia, conteudo):
   </div>
 
   <h2 style="font-size:18px;font-weight:500;margin:0 0 12px">Fechamento do dia</h2>
-  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px">
-    <div style="background:#16162a;border-radius:8px;padding:14px">
-      <div style="font-size:11px;color:#6b6b90;text-transform:uppercase;font-family:monospace">Entradas</div>
-      <div style="font-size:22px;font-weight:500;margin-top:4px">{dia['entradas']}</div>
-    </div>
-    <div style="background:#16162a;border-radius:8px;padding:14px">
-      <div style="font-size:11px;color:#6b6b90;text-transform:uppercase;font-family:monospace">P/L</div>
-      <div style="font-size:22px;font-weight:500;margin-top:4px;color:{plcolor}">{fmtU(dia['plU'])}</div>
-      <div style="font-size:11px;color:#6b6b90;margin-top:2px">{fmtR(dia['plR'])}</div>
-    </div>
-    <div style="background:#16162a;border-radius:8px;padding:14px">
-      <div style="font-size:11px;color:#6b6b90;text-transform:uppercase;font-family:monospace">ROI</div>
-      <div style="font-size:22px;font-weight:500;margin-top:4px;color:{plcolor}">{pct(dia['roiU'])}</div>
-    </div>
-    <div style="background:#16162a;border-radius:8px;padding:14px">
-      <div style="font-size:11px;color:#6b6b90;text-transform:uppercase;font-family:monospace">Acerto</div>
-      <div style="font-size:22px;font-weight:500;margin-top:4px">{dia['acerto']:.1f}%</div>
-    </div>
+  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:24px">
+    {cards_topo}
   </div>
 
-  {''.join(blocos)}
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px">
+    {bloco_u}
+    {bloco_r}
+  </div>
 
   <h2 style="font-size:18px;font-weight:500;margin:24px 0 12px">Mês vs. acumulado</h2>
   <div style="background:#16162a;border-radius:8px;padding:16px 20px;margin-bottom:16px">
@@ -485,8 +492,6 @@ def fechar_dia():
         apostas = sb_get(f'apostas?select=data_evento,stake_unidades,lucro_unidades,status,tipster_id,bookie_id,operador_id,odd&limit=100000')
         stakes = sb_get('stakes_historico?select=tipster_id,valor_reais,vigente_a_partir')
         tipsters = sb_get('tipsters?select=id,nome')
-        bookies = sb_get('bookies?select=id,nome')
-        operadores = sb_get('operadores?select=id,nome')
 
         print(f"  → {len(apostas)} apostas, {len(stakes)} stakes, {len(tipsters)} tipsters")
 
@@ -499,38 +504,33 @@ def fechar_dia():
         mes  = agregar_periodo(apostas, stakes, mes_de, mes_ate)
         acum = agregar_periodo(apostas, stakes, INICIO_OPERACAO, data_ref)
 
-        tops_dia = tops_periodo(apostas, stakes, data_ref, data_ref, tipsters, bookies, operadores)
-        tops_mes = tops_periodo(apostas, stakes, mes_de, mes_ate, tipsters, bookies, operadores)
+        grupos_dia = tops_grupos_periodo(apostas, stakes, data_ref, data_ref, tipsters)
+        top_u = sorted(grupos_dia, key=lambda g: g['plU'], reverse=True)
+        top_r = sorted(grupos_dia, key=lambda g: g['plR'], reverse=True)
 
         print(f"  → Dia: {fmtU(dia['plU'])} | Mês: {fmtU(mes['plU'])} | Acum: {fmtU(acum['plU'])}")
 
-        # 3. Gerar conteúdo via Claude
-        print("  → Chamando Claude...")
-        conteudo = gerar_conteudo_claude(data_ref, dia, mes, acum, tops_dia, tops_mes)
-        print(f"  → Frase: {conteudo.get('frase_twitter','')[:60]}")
+        # 3. Montar resumo do Telegram (sem IA)
+        resumo_tg = gerar_resumo_telegram(data_ref, dia, mes, acum, top_u, top_r)
 
         # 4. Gerar HTML do briefing
-        html = gerar_html_briefing(data_ref, dia, mes, acum, tops_dia, conteudo)
+        html = gerar_html_briefing(data_ref, dia, mes, acum, top_u, top_r)
 
         # 5. Salvar no Supabase
         print("  → Salvando briefing no Supabase...")
         sb_upsert('briefings', {
             'data_ref': data_ref,
-            'resumo_telegram': conteudo.get('resumo_telegram', ''),
+            'resumo_telegram': resumo_tg,
             'html_completo': html,
-            'frase_twitter': conteudo.get('frase_twitter', ''),
-            'destaques_json': {
-                'positivo': conteudo.get('destaque_positivo'),
-                'alerta': conteudo.get('destaque_alerta'),
-                'curiosidade': conteudo.get('curiosidade'),
-            },
+            'frase_twitter': '',
+            'destaques_json': {},
             'metricas_json': {'dia': dia, 'mes': mes, 'acum': acum},
             'criado_por': usuario,
         })
 
         # 6. Disparar Telegram
         print("  → Enviando Telegram...")
-        msg_tg = conteudo.get('resumo_telegram', '') + f"\n\n📊 [Ver briefing completo]({DASH_URL}#briefing/{data_ref})"
+        msg_tg = resumo_tg + f"\n\n📊 [Ver briefing completo]({DASH_URL}#briefing/{data_ref})"
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg_tg, 'parse_mode': 'Markdown', 'disable_web_page_preview': True},
@@ -539,19 +539,17 @@ def fechar_dia():
 
         # 7. Gerar card do Twitter e salvar como base64 para download manual
         tweet_id = None
-        texto_tw = f"Fechamento de {dt_ref.strftime('%d/%m')}\n\n{conteudo.get('frase_twitter','')}"
+        texto_tw = f"Fechamento de {dt_ref.strftime('%d/%m')}\n\nP/L {fmtU(dia['plU'])} · ROI {pct(dia['roiU'])} · {dia['entradas']} entradas"
         try:
             print("  → Gerando card do Twitter...")
-            card = gerar_card_twitter(data_ref, dia, mes, acum, conteudo.get('frase_twitter', ''))
+            card = gerar_card_twitter(data_ref, dia, mes, acum, top_u, top_r)
             import base64
             card.seek(0)
             card_b64 = base64.b64encode(card.read()).decode('ascii')
             sb_upsert('briefings', {
                 'data_ref': data_ref,
-                'twitter_post_id': f"MANUAL::{texto_tw}",  # guarda texto sugerido
+                'twitter_post_id': f"MANUAL::{texto_tw}",
             })
-            # Salva card base64 via campo destaques_json (reutiliza)
-            # Simpler: retorna no response pra dashboard baixar
             print(f"  ✅ Card gerado ({len(card_b64)} chars base64)")
         except Exception as e:
             print(f"  ⚠️ Erro gerando card: {e}")
