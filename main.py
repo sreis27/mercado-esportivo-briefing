@@ -489,7 +489,11 @@ def fechar_dia():
 
         # 1. Buscar todos os dados
         print("  → Buscando apostas...")
-        apostas = sb_get(f'apostas?select=data_evento,stake_unidades,lucro_unidades,status,tipster_id,bookie_id,operador_id,odd&limit=100000')
+        # O briefing só agrega a partir de INICIO_OPERACAO — buscar além disso é desperdício
+        # e estourou o teto de 100k linhas em 06/09/2026 (tabela cruzou 100.000 apostas),
+        # truncando o payload sem aviso. order=desc garante que, se um dia a janela
+        # exceder o limit, as linhas cortadas sejam as mais antigas, nunca as do dia.
+        apostas = sb_get(f'apostas?select=data_evento,stake_unidades,lucro_unidades,status,tipster_id,bookie_id,operador_id,odd&data_evento=gte.{INICIO_OPERACAO}&order=data_evento.desc&limit=100000')
         stakes = sb_get('stakes_historico?select=tipster_id,valor_reais,vigente_a_partir')
         tipsters = sb_get('tipsters?select=id,nome')
 
