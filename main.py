@@ -17,6 +17,7 @@ SUPABASE_URL     = "https://yfdrifvhsiumdxgypkjm.supabase.co"
 SUPABASE_KEY     = os.environ.get("SUPABASE_KEY", "")
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-4659428992")
+PAUSAR_CHAT      = os.environ.get("PAUSAR_CHAT", "") == "1"  # 1 = não envia o fechamento pro Telegram
 TW_API_KEY       = os.environ.get("TW_API_KEY", "")
 TW_API_SECRET    = os.environ.get("TW_API_SECRET", "")
 TW_ACCESS_TOKEN  = os.environ.get("TW_ACCESS_TOKEN", "")
@@ -533,13 +534,16 @@ def fechar_dia():
         })
 
         # 6. Disparar Telegram
-        print("  → Enviando Telegram...")
         msg_tg = resumo_tg + f"\n\n📊 [Ver briefing completo]({DASH_URL}#briefing/{data_ref})"
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg_tg, 'parse_mode': 'Markdown', 'disable_web_page_preview': True},
-            timeout=15
-        ).raise_for_status()
+        if PAUSAR_CHAT:
+            print("  → Telegram pausado (PAUSAR_CHAT=1), envio suprimido", flush=True)
+        else:
+            print("  → Enviando Telegram...")
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={'chat_id': TELEGRAM_CHAT_ID, 'text': msg_tg, 'parse_mode': 'Markdown', 'disable_web_page_preview': True},
+                timeout=15
+            ).raise_for_status()
 
         # 7. Gerar card do Twitter e salvar como base64 para download manual
         tweet_id = None
